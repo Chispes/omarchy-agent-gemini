@@ -40,12 +40,22 @@ if [ -d "$ASSETS_DEST" ]; then
     fi
 fi
 
-# 4. Trigger update
+# 4. Trigger update as the invoking non-root user if sudo was used
 echo "--> Updating agent usage data..."
-if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
-    omarchy-agent-usage-update --force || true
-elif [ -x "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" ]; then
-    "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" --force || true
+RUN_USER="${SUDO_USER:-$USER}"
+
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
+        sudo -u "$RUN_USER" omarchy-agent-usage-update --force || true
+    elif [ -x "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" ]; then
+        sudo -u "$RUN_USER" "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" --force || true
+    fi
+else
+    if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
+        omarchy-agent-usage-update --force || true
+    elif [ -x "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" ]; then
+        "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" --force || true
+    fi
 fi
 
 echo ""
