@@ -5,7 +5,8 @@
 """Collect Gemini / Google Antigravity usage into one display-ready JSON record.
 
 Local stats come from Antigravity CLI session files, transcripts, conversation
-summaries, and history, plus opencode/pi/omp sessions using Gemini/Google models.
+summaries, and history, plus opencode/pi/omp sessions using Gemini/Google models;
+rate limits and quotas come from Antigravity's usage probe.
 The Omarchy agents panel only ever reads the JSON this prints.
 """
 
@@ -18,7 +19,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -31,6 +34,7 @@ AUTH_HELP = "Sign in to Antigravity CLI with `agy` or Gemini in OpenCode."
 
 SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
+LIMITS_CACHE_SECONDS = 30
 
 
 def expand_path(value: str) -> Path:
@@ -150,6 +154,84 @@ def detect_account_info() -> tuple[str, str]:
   if email:
     tier = email
   return email, tier
+
+
+# ----------------------------------------------------------- rate limits / quotas
+
+
+def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
+  cache_file = cache_root() / "gemini-limits.json"
+  if not force:
+    cached = read_fresh_json(cache_file, LIMITS_CACHE_SECONDS)
+    if cached is not None and isinstance(cached.get("limits"), list):
+      return cached["limits"]
+
+  agy_bin = shutil.which("agy") or shutil.which("gemini")
+  if not agy_bin:
+    return []
+
+  try:
+    proc = subprocess.run(
+      [agy_bin, "-p", "/usage", "--output-format", "json"],
+      capture_output=True,
+      text=True,
+      timeout=6,
+    )
+    if proc.returncode != 0:
+      return []
+
+    data = json.loads(proc.stdout)
+    groups = data.get("command", {}).get("data", {}).get("groups", [])
+    limits: list[dict[str, Any]] = []
+
+    session_limit: dict[str, Any] | None = None
+    weekly_limit: dict[str, Any] | None = None
+    extra_limits: list[dict[str, Any]] = []
+
+    for group in groups:
+      g_name = str(group.get("name") or "")
+      buckets = group.get("buckets") or []
+      for b in buckets:
+        rem = float(b.get("remaining_fraction", 1.0))
+        used = max(0.0, min(1.0, 1.0 - rem))
+        reset = str(b.get("reset_time") or "")
+        window = str(b.get("window") or "").lower()
+        name = str(b.get("name") or "").lower()
+
+        if "gemini" in g_name.lower():
+          if window == "5h" or "5-hour" in name or "five" in name:
+            session_limit = {
+              "label": "Session (5-hour)",
+              "title": "Session (5-hour)",
+              "percent": round(used, 4),
+              "resetsAt": reset,
+            }
+          elif window == "weekly" or "week" in name:
+            weekly_limit = {
+              "label": "Weekly (7-day)",
+              "title": "Weekly (7-day)",
+              "percent": round(used, 4),
+              "resetsAt": reset,
+            }
+        elif used > 0.001:
+          title = f"{g_name} {window.capitalize() if window else 'Limit'}"
+          extra_limits.append({
+            "label": title,
+            "title": title,
+            "percent": round(used, 4),
+            "resetsAt": reset,
+          })
+
+    if session_limit:
+      limits.append(session_limit)
+    if weekly_limit:
+      limits.append(weekly_limit)
+    limits.extend(extra_limits)
+
+    write_json(cache_file, {"limits": limits, "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat()})
+    return limits
+  except Exception:
+    return []
 
 
 # ----------------------------------------------------------- antigravity scans
@@ -570,6 +652,7 @@ def main() -> None:
     stats = collect_local_stats()
 
   _, tier_label = detect_account_info()
+  limits = probe_agy_limits(force=args.force)
 
   record: dict[str, Any] = {
     "schemaVersion": 1,
@@ -582,7 +665,7 @@ def main() -> None:
     "tierLabel": tier_label,
     "usageStatusText": "",
     "authHelpText": AUTH_HELP,
-    "limits": [],
+    "limits": limits,
   }
   record.update(stats)
 
