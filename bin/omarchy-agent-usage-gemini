@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -36,10 +37,12 @@ SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
 LIMITS_CACHE_SECONDS = 30
 
-# Bounds to prevent unbounded CPU/memory consumption on large local histories
+# Strict hard bounds to prevent unbounded CPU/memory consumption on large local histories
 HISTORY_CUTOFF_DAYS = 30
-MAX_TRANSCRIPT_FILES = 100
-MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024  # 4 MB per file
+MAX_TAIL_BYTES = 256 * 1024           # 256 KB max for history tail buffer
+MAX_TRANSCRIPT_FILES = 100            # Max recent files to inspect
+MAX_DIRS_TO_SCAN = 300                # Max directories visited during traversal
+MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 # 4 MB max per transcript file
 MAX_SESSIONS_RECORDED = 500
 MAX_MODELS_RECORDED = 15
 
@@ -146,6 +149,68 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     raise
 
 
+# ----------------------------------------------------------------- bounded helpers
+
+
+def read_tail_lines(file_path: Path, max_bytes: int = MAX_TAIL_BYTES) -> list[str]:
+  """Read only the tail of a file without loading the entire file into memory."""
+  if not file_path.is_file():
+    return []
+  try:
+    size = file_path.stat().st_size
+    if size <= 0:
+      return []
+    with file_path.open("rb") as f:
+      if size > max_bytes:
+        f.seek(size - max_bytes)
+        f.readline()  # discard partial first line
+      chunk = f.read().decode("utf-8", errors="replace")
+      return [line for line in chunk.splitlines() if line.strip()]
+  except OSError:
+    return []
+
+
+def find_recent_files(
+  root: Path,
+  pattern: str,
+  cutoff_time: float,
+  max_files: int = MAX_TRANSCRIPT_FILES,
+  max_dirs: int = MAX_DIRS_TO_SCAN,
+) -> list[Path]:
+  """Find recent files matching pattern with bounded traversal and early exit."""
+  if not root.is_dir():
+    return []
+
+  matched: list[tuple[float, Path]] = []
+  dirs_visited = 0
+  stack = [root]
+
+  while stack and dirs_visited < max_dirs and len(matched) < max_files * 2:
+    current = stack.pop()
+    dirs_visited += 1
+    try:
+      with os.scandir(current) as it:
+        for entry in it:
+          try:
+            if entry.is_dir(follow_symlinks=False):
+              # Skip hidden dirs except .system_generated
+              if not entry.name.startswith(".") or entry.name == ".system_generated":
+                stack.append(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+              if fnmatch.fnmatch(entry.name, pattern):
+                st = entry.stat()
+                if st.st_mtime >= cutoff_time and st.st_size <= MAX_FILE_SIZE_BYTES:
+                  matched.append((st.st_mtime, Path(entry.path)))
+          except OSError:
+            continue
+    except OSError:
+      continue
+
+  # Sort newest first and cap to max_files
+  matched.sort(key=lambda x: x[0], reverse=True)
+  return [p for _, p in matched[:max_files]]
+
+
 # ---------------------------------------------------------------- account discovery
 
 
@@ -250,9 +315,10 @@ def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
 
 
 def scan_antigravity_history() -> tuple[int, set[str], set[str], dict[str, int]]:
-  """Scan history.jsonl from Antigravity CLI in reverse with cutoff."""
+  """Scan tail of history.jsonl from Antigravity CLI in reverse with cutoff."""
   history_file = Path.home() / ".gemini" / "antigravity-cli" / "history.jsonl"
-  if not history_file.is_file():
+  lines = read_tail_lines(history_file, MAX_TAIL_BYTES)
+  if not lines:
     return 0, set(), set(), {}
 
   today = local_date_string()
@@ -264,39 +330,29 @@ def scan_antigravity_history() -> tuple[int, set[str], set[str], dict[str, int]]
   all_sessions: set[str] = set()
   active_days: dict[str, int] = {}
 
-  try:
-    with history_file.open("r", encoding="utf-8", errors="replace") as f:
-      lines = f.readlines()
+  for line in reversed(lines):
+    try:
+      entry = json.loads(line)
+    except Exception:
+      continue
 
-    # Walk in reverse and break once older than 30 days
-    for line in reversed(lines):
-      line = line.strip()
-      if not line:
-        continue
-      try:
-        entry = json.loads(line)
-      except Exception:
-        continue
+    ts = entry.get("timestamp")
+    if isinstance(ts, (int, float)) and ts < cutoff_ts:
+      break
 
-      ts = entry.get("timestamp")
-      if isinstance(ts, (int, float)) and ts < cutoff_ts:
-        break
+    day = local_date_from_timestamp(ts)
+    if day < min_cutoff_date:
+      break
 
-      day = local_date_from_timestamp(ts)
-      if day < min_cutoff_date:
-        break
+    conv_id = str(entry.get("conversationId") or entry.get("workspace") or "default")
+    if len(all_sessions) < MAX_SESSIONS_RECORDED:
+      all_sessions.add(conv_id)
+    active_days[day] = active_days.get(day, 0) + 1
 
-      conv_id = str(entry.get("conversationId") or entry.get("workspace") or "default")
-      if len(all_sessions) < MAX_SESSIONS_RECORDED:
-        all_sessions.add(conv_id)
-      active_days[day] = active_days.get(day, 0) + 1
-
-      if day == today:
-        today_prompts += 1
-        if len(today_sessions) < MAX_SESSIONS_RECORDED:
-          today_sessions.add(conv_id)
-  except Exception:
-    pass
+    if day == today:
+      today_prompts += 1
+      if len(today_sessions) < MAX_SESSIONS_RECORDED:
+        today_sessions.add(conv_id)
 
   return today_prompts, today_sessions, all_sessions, active_days
 
@@ -319,92 +375,76 @@ def scan_antigravity_transcripts() -> dict[str, Any]:
   today_token_total = 0
 
   brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
-  if brain_dir.is_dir():
-    # Filter files by mtime cutoff and cap total files
-    candidate_files: list[tuple[float, Path]] = []
+  selected_files = find_recent_files(brain_dir, "transcript*.jsonl", cutoff_time, MAX_TRANSCRIPT_FILES, MAX_DIRS_TO_SCAN)
+
+  for path in selected_files:
+    session_id = path.parent.parent.name
+    if len(sessions) < MAX_SESSIONS_RECORDED:
+      sessions.add(session_id)
     try:
-      for path in brain_dir.rglob("transcript*.jsonl"):
-        try:
-          st = path.stat()
-          if st.st_mtime >= cutoff_time and st.st_size <= MAX_FILE_SIZE_BYTES:
-            candidate_files.append((st.st_mtime, path))
-        except OSError:
-          continue
-    except OSError:
-      pass
+      with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+          # Cheap pre-filter before JSON decode
+          if '"USER_INPUT"' not in line and '"PLANNER_RESPONSE"' not in line and '"GENERIC"' not in line and '"usage"' not in line:
+            continue
+          try:
+            entry = json.loads(line)
+          except Exception:
+            continue
 
-    # Sort newest first, bounded by MAX_TRANSCRIPT_FILES
-    candidate_files.sort(key=lambda x: x[0], reverse=True)
-    selected_files = [p for _, p in candidate_files[:MAX_TRANSCRIPT_FILES]]
+          created_at = entry.get("created_at")
+          day = local_date_from_timestamp(created_at)
+          if day < min_cutoff_date:
+            continue
 
-    for path in selected_files:
-      session_id = path.parent.parent.name
-      if len(sessions) < MAX_SESSIONS_RECORDED:
-        sessions.add(session_id)
-      try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-          for line in f:
-            # Cheap pre-filter before JSON decode
-            if '"USER_INPUT"' not in line and '"PLANNER_RESPONSE"' not in line and '"GENERIC"' not in line and '"usage"' not in line:
-              continue
-            try:
-              entry = json.loads(line)
-            except Exception:
-              continue
+          active_days.add(day)
+          entry_type = entry.get("type")
+          source = entry.get("source")
 
-            created_at = entry.get("created_at")
-            day = local_date_from_timestamp(created_at)
-            if day < min_cutoff_date:
-              continue
+          model = "gemini-3.7-flash"
+          input_tokens = 0
+          output_tokens = 0
+          cache_read = 0
+          cache_write = 0
 
-            active_days.add(day)
-            entry_type = entry.get("type")
-            source = entry.get("source")
-
-            model = "gemini-3.7-flash"
-            input_tokens = 0
-            output_tokens = 0
-            cache_read = 0
-            cache_write = 0
-
-            if "usage" in entry and isinstance(entry["usage"], dict):
-              u = entry["usage"]
-              input_tokens = number(u.get("prompt_tokens") or u.get("input_tokens") or u.get("inputTokens"))
-              output_tokens = number(u.get("completion_tokens") or u.get("output_tokens") or u.get("outputTokens"))
-              cache_read = number(u.get("cached_tokens") or u.get("cacheReadInputTokens"))
-            elif entry_type == "USER_INPUT":
-              prompts += 1
-              content = str(entry.get("content") or "")
-              input_tokens = max(1, len(content) // 4)
-              if day == today:
-                today_prompt_count += 1
-                if len(today_sessions) < MAX_SESSIONS_RECORDED:
-                  today_sessions.add(session_id)
-            elif entry_type in ("PLANNER_RESPONSE", "GENERIC") and source == "MODEL":
-              content = str(entry.get("content") or "")
-              thinking = str(entry.get("thinking") or "")
-              output_tokens = max(1, (len(content) + len(thinking)) // 4)
-            else:
-              continue
-
-            total = input_tokens + output_tokens + cache_read + cache_write
-            if total <= 0:
-              continue
-
-            bucket = usage_by_model.setdefault(model, empty_bucket())
-            bucket["inputTokens"] += input_tokens
-            bucket["outputTokens"] += output_tokens
-            bucket["cacheReadInputTokens"] += cache_read
-            bucket["cacheCreationInputTokens"] += cache_write
-
-            if day in recent:
-              recent[day]["messageCount"] += total
-
+          if "usage" in entry and isinstance(entry["usage"], dict):
+            u = entry["usage"]
+            input_tokens = number(u.get("prompt_tokens") or u.get("input_tokens") or u.get("inputTokens"))
+            output_tokens = number(u.get("completion_tokens") or u.get("output_tokens") or u.get("outputTokens"))
+            cache_read = number(u.get("cached_tokens") or u.get("cacheReadInputTokens"))
+          elif entry_type == "USER_INPUT":
+            prompts += 1
+            content = str(entry.get("content") or "")
+            input_tokens = max(1, len(content) // 4)
             if day == today:
-              today_token_total += total
-              today_tokens[model] = today_tokens.get(model, 0) + total
-      except Exception:
-        continue
+              today_prompt_count += 1
+              if len(today_sessions) < MAX_SESSIONS_RECORDED:
+                today_sessions.add(session_id)
+          elif entry_type in ("PLANNER_RESPONSE", "GENERIC") and source == "MODEL":
+            content = str(entry.get("content") or "")
+            thinking = str(entry.get("thinking") or "")
+            output_tokens = max(1, (len(content) + len(thinking)) // 4)
+          else:
+            continue
+
+          total = input_tokens + output_tokens + cache_read + cache_write
+          if total <= 0:
+            continue
+
+          bucket = usage_by_model.setdefault(model, empty_bucket())
+          bucket["inputTokens"] += input_tokens
+          bucket["outputTokens"] += output_tokens
+          bucket["cacheReadInputTokens"] += cache_read
+          bucket["cacheCreationInputTokens"] += cache_write
+
+          if day in recent:
+            recent[day]["messageCount"] += total
+
+          if day == today:
+            today_token_total += total
+            today_tokens[model] = today_tokens.get(model, 0) + total
+    except Exception:
+      continue
 
   # Read summaries db for additional sessions (bounded query)
   db_path = Path.home() / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
@@ -595,21 +635,7 @@ def scan_pi_usage() -> dict[str, Any] | None:
   for root in roots:
     if not root.is_dir():
       continue
-    # Filter files by cutoff
-    candidate_files = []
-    try:
-      for path in root.rglob("*.jsonl"):
-        try:
-          st = path.stat()
-          if st.st_mtime >= cutoff_time and st.st_size <= MAX_FILE_SIZE_BYTES:
-            candidate_files.append((st.st_mtime, path))
-        except OSError:
-          continue
-    except OSError:
-      continue
-
-    candidate_files.sort(key=lambda x: x[0], reverse=True)
-    selected_files = [p for _, p in candidate_files[:MAX_TRANSCRIPT_FILES]]
+    selected_files = find_recent_files(root, "*.jsonl", cutoff_time, MAX_TRANSCRIPT_FILES, MAX_DIRS_TO_SCAN)
 
     for path in selected_files:
       try:
