@@ -1,61 +1,72 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # ==============================================================================
 # Installer for Omarchy Gemini / Antigravity Agent Collector
 # https://github.com/Chispes/omarchy-agent-gemini
+#
+# Touches exactly three things, all of them Omarchy's own:
+#   /usr/bin/omarchy-agent-usage-gemini                  the collector
+#   $OMARCHY_PATH/bin/omarchy-agent-usage-gemini         symlink; how it is found
+#   $OMARCHY_PATH/shell/plugins/agents/assets/gemini*.svg  optional bar mark
+# No user configuration is read or written.
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_SRC="$SCRIPT_DIR/bin/omarchy-agent-usage-gemini"
 ASSETS_SRC="$SCRIPT_DIR/assets"
 
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
 BIN_DEST="/usr/bin/omarchy-agent-usage-gemini"
-OMARCHY_BIN_DIR="/usr/share/omarchy/bin"
-ASSETS_DEST="/usr/share/omarchy/shell/plugins/agents/assets"
+OMARCHY_BIN_DIR="$OMARCHY_PATH/bin"
+ASSETS_DEST="$OMARCHY_PATH/shell/plugins/agents/assets"
+
+fail() {
+  echo "install.sh: $*" >&2
+  exit 1
+}
 
 echo "==> Installing Omarchy Gemini Usage Collector..."
 
-# Ensure script is executable
+[ -f "$BIN_SRC" ] || fail "collector missing at $BIN_SRC"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to run the collector"
+
+# omarchy-agent-usage-update discovers collectors by globbing
+# "$OMARCHY_PATH"/bin/omarchy-agent-usage-* and nothing else, so without that
+# directory the collector would install and then never be run by anything.
+# Skipping the link quietly is how an install "succeeds" and does nothing.
+[ -d "$OMARCHY_BIN_DIR" ] || fail "$OMARCHY_BIN_DIR not found -- is Omarchy installed?"
+
 chmod +x "$BIN_SRC"
 
-# 1. Install binary to /usr/bin
 echo "--> Installing $BIN_DEST..."
 sudo install -m 755 "$BIN_SRC" "$BIN_DEST"
 
-# 2. Symlink to /usr/share/omarchy/bin if directory exists
-if [ -d "$OMARCHY_BIN_DIR" ]; then
-    echo "--> Linking to $OMARCHY_BIN_DIR/omarchy-agent-usage-gemini..."
-    sudo ln -sf "$BIN_DEST" "$OMARCHY_BIN_DIR/omarchy-agent-usage-gemini"
-fi
+echo "--> Linking $OMARCHY_BIN_DIR/omarchy-agent-usage-gemini..."
+sudo ln -sf "$BIN_DEST" "$OMARCHY_BIN_DIR/omarchy-agent-usage-gemini"
 
-# 3. Install Assets (Icons)
+# The mark is genuinely optional: the agents panel falls back to its bar glyph
+# for a provider that ships no assets/<id>.svg, so a missing directory here
+# costs an icon, not the feature.
 if [ -d "$ASSETS_DEST" ]; then
-    echo "--> Installing icons to $ASSETS_DEST..."
-    if [ -f "$ASSETS_SRC/gemini.svg" ]; then
-        sudo install -m 644 "$ASSETS_SRC/gemini.svg" "$ASSETS_DEST/gemini.svg"
+  echo "--> Installing icons to $ASSETS_DEST..."
+  for icon in gemini.svg gemini-light.svg; do
+    if [ -f "$ASSETS_SRC/$icon" ]; then
+      sudo install -m 644 "$ASSETS_SRC/$icon" "$ASSETS_DEST/$icon"
     fi
-    if [ -f "$ASSETS_SRC/gemini-light.svg" ]; then
-        sudo install -m 644 "$ASSETS_SRC/gemini-light.svg" "$ASSETS_DEST/gemini-light.svg"
-    fi
+  done
+else
+  echo "--> Icons skipped ($ASSETS_DEST not found); the panel will use its bar glyph."
 fi
 
-# 4. Trigger update as the invoking non-root user if sudo was used
+# Refresh as the invoking user: the record belongs under their XDG state dir,
+# and running the collector as root would write it into root's.
 echo "--> Updating agent usage data..."
 RUN_USER="${SUDO_USER:-$USER}"
-
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-    if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
-        sudo -u "$RUN_USER" omarchy-agent-usage-update --force || true
-    elif [ -x "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" ]; then
-        sudo -u "$RUN_USER" "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" --force || true
-    fi
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  sudo -u "$RUN_USER" omarchy-agent-usage-update gemini --force || true
 else
-    if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
-        omarchy-agent-usage-update --force || true
-    elif [ -x "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" ]; then
-        "$OMARCHY_BIN_DIR/omarchy-agent-usage-update" --force || true
-    fi
+  omarchy-agent-usage-update gemini --force || true
 fi
 
 echo ""

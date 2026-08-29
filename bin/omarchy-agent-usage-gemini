@@ -17,11 +17,13 @@ import datetime as dt
 import fcntl
 import fnmatch
 import hashlib
+import heapq
 import json
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,6 +47,11 @@ MAX_DIRS_TO_SCAN = 300                # Max directories visited during traversal
 MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024 # 4 MB max per transcript file
 MAX_SESSIONS_RECORDED = 500
 MAX_MODELS_RECORDED = 15
+MAX_DIR_ENTRIES_SCANNED = 200000      # Global directory-entry budget for one traversal
+MAX_ENTRIES_PER_DIR = 4000            # Per-directory share of that budget
+MAX_PENDING_DIRS = 1000               # Max directories retained in the pending stack
+MAX_LINE_BYTES = 256 * 1024           # 256 KB max retained for a single line
+READ_CHUNK_BYTES = 64 * 1024          # Read granularity for bounded line iteration
 
 
 def expand_path(value: str) -> Path:
@@ -125,14 +132,21 @@ def scan_cache_paths() -> tuple[Path, Path]:
 
 
 def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
-  if max_age_seconds <= 0 or not path.exists():
+  if max_age_seconds <= 0:
     return None
-  try:
-    age = time.time() - path.stat().st_mtime
-    if 0 <= age <= max_age_seconds:
-      return json.loads(path.read_text(encoding="utf-8"))
-  except Exception:
+  opened = open_regular(path, max_bytes=MAX_FILE_SIZE_BYTES)
+  if opened is None:
     return None
+  handle, st = opened
+  with handle:
+    try:
+      # Freshness comes from the fstat of the descriptor being read, so the
+      # age decision and the content are taken from the same object.
+      age = time.time() - st.st_mtime
+      if 0 <= age <= max_age_seconds:
+        return json.loads(handle.read(MAX_FILE_SIZE_BYTES).decode("utf-8", errors="replace"))
+    except Exception:
+      return None
   return None
 
 
@@ -152,22 +166,95 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 # ----------------------------------------------------------------- bounded helpers
 
 
+def open_regular(file_path: Path, max_bytes: int | None = None) -> tuple[Any, os.stat_result] | None:
+  """Open a regular file read-only, returning it with the fstat of that same descriptor.
+
+  The size check is deliberately bound to the descriptor we go on to read from
+  rather than to the path. A stat() on a path and a later open() of that path
+  are two different objects, so a file swapped or grown in between escapes a
+  path-based cap; os.fstat() on the already-open descriptor cannot be raced
+  that way, and O_NOFOLLOW stops a symlink from redirecting the read.
+  """
+  try:
+    fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+  except OSError:
+    return None
+  try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+      raise OSError("not a regular file")
+    if max_bytes is not None and st.st_size > max_bytes:
+      raise OSError("file exceeds size budget")
+    handle = os.fdopen(fd, "rb")
+  except OSError:
+    try:
+      os.close(fd)
+    except OSError:
+      pass
+    return None
+  return handle, st
+
+
+def iter_bounded_lines(
+  handle: Any,
+  max_bytes: int = MAX_FILE_SIZE_BYTES,
+  max_line_bytes: int = MAX_LINE_BYTES,
+):
+  """Yield decoded lines from a binary handle under a hard byte budget.
+
+  Reading fixed-size chunks is what keeps a file with no newlines from arriving
+  as one enormous line: an over-long line is dropped and the reader resyncs at
+  the next newline, so peak memory stays O(max_line_bytes) no matter how the
+  file grew after it was opened.
+  """
+  remaining = max_bytes
+  buf = b""
+  skipping = False
+  while remaining > 0:
+    try:
+      chunk = handle.read(min(READ_CHUNK_BYTES, remaining))
+    except OSError:
+      return
+    if not chunk:
+      break
+    remaining -= len(chunk)
+    buf += chunk
+    while True:
+      newline = buf.find(b"\n")
+      if newline < 0:
+        break
+      line, buf = buf[:newline], buf[newline + 1:]
+      if skipping:
+        skipping = False
+        continue
+      if line.strip():
+        yield line.decode("utf-8", errors="replace")
+    if len(buf) > max_line_bytes:
+      # Oversized line: drop what we hold and resync at the next newline
+      # instead of letting the buffer grow with it.
+      buf = b""
+      skipping = True
+  if buf and not skipping and len(buf) <= max_line_bytes and buf.strip():
+    yield buf.decode("utf-8", errors="replace")
+
+
 def read_tail_lines(file_path: Path, max_bytes: int = MAX_TAIL_BYTES) -> list[str]:
   """Read only the tail of a file without loading the entire file into memory."""
-  if not file_path.is_file():
+  opened = open_regular(file_path)
+  if opened is None:
     return []
-  try:
-    size = file_path.stat().st_size
-    if size <= 0:
+  handle, st = opened
+  with handle:
+    try:
+      if st.st_size <= 0:
+        return []
+      if st.st_size > max_bytes:
+        handle.seek(st.st_size - max_bytes)
+        handle.readline(max_bytes)  # discard partial first line, bounded
+      chunk = handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
       return []
-    with file_path.open("rb") as f:
-      if size > max_bytes:
-        f.seek(size - max_bytes)
-        f.readline()  # discard partial first line
-      chunk = f.read().decode("utf-8", errors="replace")
-      return [line for line in chunk.splitlines() if line.strip()]
-  except OSError:
-    return []
+  return [line for line in chunk.splitlines() if line.strip()]
 
 
 def find_recent_files(
@@ -176,29 +263,64 @@ def find_recent_files(
   cutoff_time: float,
   max_files: int = MAX_TRANSCRIPT_FILES,
   max_dirs: int = MAX_DIRS_TO_SCAN,
+  max_entries: int = MAX_DIR_ENTRIES_SCANNED,
 ) -> list[Path]:
-  """Find recent files matching pattern with bounded traversal and early exit."""
+  """Find recent files matching pattern with bounded traversal and early exit.
+
+  The walk is bounded on five independent axes -- directories visited, pending
+  directories retained, entries examined per directory, entries examined in
+  total, and matches kept -- so no single directory can dominate the scan.
+
+  Two details keep those bounds from quietly costing coverage. The per-directory
+  share stops the first pathological directory from spending the whole global
+  budget, which would bound the CPU but blind the collector to the siblings
+  where the transcripts actually live. And directories come off the queue newest
+  first, because a budget is only as good as where it gets spent: session
+  directories are written as they are used, so mtime order puts the live ones
+  ahead of whatever else shares the tree. What a truncated walk drops is then
+  the least recently touched material, which is also what the 30-day cutoff was
+  going to discard anyway.
+  """
   if not root.is_dir():
     return []
 
   matched: list[tuple[float, Path]] = []
+  keep_limit = max_files * 2
+  entries_left = max_entries
   dirs_visited = 0
-  stack = [root]
+  # (-mtime, tiebreak, path): heapq is a min-heap, so negating gives newest-first.
+  order = 0
+  pending: list[tuple[float, int, Path]] = [(0.0, 0, root)]
 
-  while stack and dirs_visited < max_dirs and len(matched) < max_files * 2:
-    current = stack.pop()
+  while pending and dirs_visited < max_dirs and entries_left > 0 and len(matched) < keep_limit:
+    _, _, current = heapq.heappop(pending)
     dirs_visited += 1
+    dir_budget = min(MAX_ENTRIES_PER_DIR, entries_left)
     try:
       with os.scandir(current) as it:
         for entry in it:
+          # Charged per entry examined and tested inside the loop, so a
+          # directory holding millions of non-matching files stops the walk
+          # mid-iteration rather than running to completion first.
+          dir_budget -= 1
+          entries_left -= 1
+          if dir_budget <= 0 or len(matched) >= keep_limit:
+            break
           try:
             if entry.is_dir(follow_symlinks=False):
-              # Skip hidden dirs except .system_generated
-              if not entry.name.startswith(".") or entry.name == ".system_generated":
-                stack.append(Path(entry.path))
+              # Hidden dirs are skipped, bar Antigravity's .system_generated.
+              # The queue is capped too, so a wide tree cannot retain an
+              # unbounded list of pending paths.
+              if entry.name.startswith(".") and entry.name != ".system_generated":
+                continue
+              if len(pending) < MAX_PENDING_DIRS:
+                order += 1
+                heapq.heappush(
+                  pending, (-entry.stat(follow_symlinks=False).st_mtime, order, Path(entry.path))
+                )
             elif entry.is_file(follow_symlinks=False):
               if fnmatch.fnmatch(entry.name, pattern):
-                st = entry.stat()
+                st = entry.stat(follow_symlinks=False)
                 if st.st_mtime >= cutoff_time and st.st_size <= MAX_FILE_SIZE_BYTES:
                   matched.append((st.st_mtime, Path(entry.path)))
           except OSError:
@@ -219,14 +341,17 @@ def detect_account_info() -> tuple[str, str]:
   tier = "Google Account"
 
   accounts_file = Path.home() / ".gemini" / "google_accounts.json"
-  if accounts_file.is_file():
-    try:
-      data = json.loads(accounts_file.read_text(encoding="utf-8"))
-      active = str(data.get("active") or "").strip()
-      if active:
-        email = active
-    except Exception:
-      pass
+  opened = open_regular(accounts_file, max_bytes=MAX_FILE_SIZE_BYTES)
+  if opened is not None:
+    handle, _ = opened
+    with handle:
+      try:
+        data = json.loads(handle.read(MAX_FILE_SIZE_BYTES).decode("utf-8", errors="replace"))
+        active = str(data.get("active") or "").strip()
+        if active:
+          email = active
+      except Exception:
+        pass
 
   if email:
     tier = email
@@ -382,8 +507,12 @@ def scan_antigravity_transcripts() -> dict[str, Any]:
     if len(sessions) < MAX_SESSIONS_RECORDED:
       sessions.add(session_id)
     try:
-      with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+      opened = open_regular(path, max_bytes=MAX_FILE_SIZE_BYTES)
+      if opened is None:
+        continue
+      handle, _ = opened
+      with handle:
+        for line in iter_bounded_lines(handle):
           # Cheap pre-filter before JSON decode
           if '"USER_INPUT"' not in line and '"PLANNER_RESPONSE"' not in line and '"GENERIC"' not in line and '"usage"' not in line:
             continue
@@ -639,8 +768,12 @@ def scan_pi_usage() -> dict[str, Any] | None:
 
     for path in selected_files:
       try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-          for line_number, line in enumerate(handle, 1):
+        opened = open_regular(path, max_bytes=MAX_FILE_SIZE_BYTES)
+        if opened is None:
+          continue
+        handle, _ = opened
+        with handle:
+          for line_number, line in enumerate(iter_bounded_lines(handle), 1):
             if '"usage"' not in line or '"assistant"' not in line:
               continue
             try:

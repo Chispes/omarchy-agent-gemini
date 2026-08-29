@@ -6,9 +6,10 @@ set -e
 # https://github.com/Chispes/omarchy-agent-gemini
 # ==============================================================================
 
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
 BIN_DEST="/usr/bin/omarchy-agent-usage-gemini"
-OMARCHY_BIN_LINK="/usr/share/omarchy/bin/omarchy-agent-usage-gemini"
-ASSETS_DEST="/usr/share/omarchy/shell/plugins/agents/assets"
+OMARCHY_BIN_LINK="$OMARCHY_PATH/bin/omarchy-agent-usage-gemini"
+ASSETS_DEST="$OMARCHY_PATH/shell/plugins/agents/assets"
 STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage/gemini.json"
 
 echo "==> Uninstalling Omarchy Gemini Usage Collector..."
