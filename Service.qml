@@ -15,7 +15,10 @@ import Quickshell.Io
 // run it from here and let it write its own record.
 //
 // install.sh is still worth running, but only for what genuinely needs root:
-// the system-wide collector and the Gemini mark in the panel's asset dir.
+// the system-wide collector, and the Gemini mark in the panel's own asset dir
+// -- the one thing a plugin cannot supply, since Panel.qml resolves a
+// provider's icon against its own root-owned directory and looks nowhere else.
+// `install.sh --icons-only` installs just the mark.
 Item {
   id: root
   visible: false

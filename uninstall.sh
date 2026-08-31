@@ -2,13 +2,27 @@
 set -e
 
 # ==============================================================================
-# Uninstaller for the system-wide Omarchy Gemini / Antigravity Agent Collector
+# Uninstaller for the Omarchy Gemini / Antigravity Agent Collector
 # https://github.com/Chispes/omarchy-agent-gemini
 #
-# This undoes install.sh only. If the plugin itself is still enabled, its
-# service keeps refreshing the usage record from the copy of the collector
-# inside the plugin directory, and the Gemini tab stays. To remove the plugin:
+# Removes everything outside the plugin directory, each part only if present,
+# so it is equally correct after `install.sh`, after `install.sh --icons-only`,
+# and after no install at all:
+#
+#   /usr/bin/omarchy-agent-usage-gemini and the $OMARCHY_PATH/bin symlink
+#   $OMARCHY_PATH/shell/plugins/agents/assets/gemini*.svg
+#   the generated record in ~/.local/state/omarchy/agents/usage/gemini.json
+#
+# The record is removed because nothing else will: the panel draws every record
+# in that directory whoever wrote it, so a leftover gemini.json keeps the tab on
+# screen, frozen at its last values, long after the plugin is gone.
+#
+# Run this while the plugin directory still exists -- this script lives in it --
+# and remove the plugin afterwards:
 #   omarchy plugin remove chispes.agent-gemini
+#
+# If the plugin stays enabled, its service simply writes the record again at the
+# next refresh; only the root-owned paths are gone for good.
 # ==============================================================================
 
 OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
