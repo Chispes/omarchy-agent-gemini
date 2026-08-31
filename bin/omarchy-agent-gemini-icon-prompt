@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# One toast, once: "the Gemini mark is missing, click to install it".
+#
+# The Agents panel resolves a provider's mark as Qt.resolvedUrl("assets/<id>.svg")
+# against its own directory, which is owned by root, and it looks nowhere else --
+# not at the plugin, not at any user path, not at the record. So the icon is the
+# one part of this plugin that `omarchy plugin add` cannot deliver, and a user
+# who never opens the README just gets the generic glyph with no clue why.
+#
+# Hence this: the plugin's service runs it after each first collect, and it
+# stays silent unless there is something to say. The toast carries its action as
+# an --exec argv, which the shell runs detached (Util.execArgv) -- which is what
+# lets the click open a terminal, ask for the password, and restart the shell
+# without killing the terminal it is running in.
+# ==============================================================================
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+MARK="$OMARCHY_PATH/shell/plugins/agents/assets/gemini.svg"
+RECORD="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage/gemini.json"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agent-gemini"
+MARKER="$STATE_DIR/icon-prompted"
+
+# The click action: a terminal, because the copy needs root and this machine
+# may have no polkit agent to ask graphically. Pause only on failure -- a
+# cancelled password prompt should leave its error on screen, a success should
+# not leave a terminal sitting there once the shell is already restarting.
+if [ "${1:-}" = "--install" ]; then
+  command -v omarchy-launch-tui >/dev/null 2>&1 || exit 0
+  exec omarchy-launch-tui --app-id=org.omarchy.agent-gemini bash -c "$(
+    printf '%q --icons-only && omarchy restart shell || { printf "\\n"; read -r -p "Press Enter to close "; }' \
+      "$PLUGIN_DIR/install.sh"
+  )"
+fi
+
+# Nothing to say once the mark is in place -- and forget that we ever asked, so
+# a future Omarchy reinstall (which takes the mark with it) is offered again.
+if [ -f "$MARK" ]; then
+  rm -f "$MARKER"
+  exit 0
+fi
+
+# Asked once is enough. This is a nudge, not a nag.
+[ -e "$MARKER" ] && exit 0
+
+# No record yet means no Gemini tab yet: the panel hides an agent with nothing
+# to report, so a toast about its icon would be about something invisible.
+[ -f "$RECORD" ] || exit 0
+
+command -v omarchy-notification-send >/dev/null 2>&1 || exit 0
+
+# Written before sending, not after: a toast that fails to send is worth losing,
+# a toast that repeats every refresh is not.
+mkdir -p "$STATE_DIR"
+: >"$MARKER"
+
+omarchy-notification-send -u low -g "󱚣" \
+  "Gemini mark not installed" \
+  "The Agents panel is drawing its generic glyph. Click here to install the icon: it asks for your password, then restarts the shell." \
+  --exec "$SELF" --install || true

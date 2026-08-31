@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "chispes.agent-gemini",
   "name": "Gemini Agent Collector",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": "Chispes",
   "license": "MIT",
   "description": "Google Gemini CLI & Antigravity token usage and rate limits collector for the Omarchy Agents panel.",

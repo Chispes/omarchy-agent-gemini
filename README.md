@@ -50,6 +50,14 @@ That copies `gemini.svg` and `gemini-light.svg` (light and dark surfaces) into
 the panel's assets directory and touches nothing else. `uninstall.sh` removes
 them again.
 
+You do not have to remember it: after its first collect the plugin checks
+whether the mark is there, and if it is not, sends one Omarchy notification
+offering to install it. Clicking it opens a terminal, runs exactly the command
+above, and restarts the shell. It is asked **once** — never again on that
+machine, unless the mark later disappears (an Omarchy reinstall, say), which
+arms the offer afresh. It stays quiet while there is no usage record either,
+since the panel draws no tab at all for an agent with nothing to report.
+
 ### Requirements
 
 - Omarchy, with the Agents widget available (`omarchy.agents`)

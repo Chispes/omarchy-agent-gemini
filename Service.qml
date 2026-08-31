@@ -27,19 +27,24 @@ Item {
   // plugin's absolute source directory in __sourceDir.
   property var manifest: null
 
-  readonly property string collectorRelPath: "bin/omarchy-agent-usage-gemini"
-
   // Resolved against this file rather than assembled from the injected
   // manifest, because the first refresh is triggered on start -- before the
   // shell has had a chance to inject anything. __sourceDir is the fallback for
   // a host that resolves the component from somewhere other than its own file.
-  readonly property string collector: {
-    var url = String(Qt.resolvedUrl(collectorRelPath))
+  function pluginPath(relative) {
+    var url = String(Qt.resolvedUrl(relative))
     if (url.indexOf("file://") === 0) return url.substring(7)
     if (manifest && manifest.__sourceDir)
-      return String(manifest.__sourceDir).replace(/\/$/, "") + "/" + collectorRelPath
+      return String(manifest.__sourceDir).replace(/\/$/, "") + "/" + relative
     return ""
   }
+
+  readonly property string collector: pluginPath("bin/omarchy-agent-usage-gemini")
+  readonly property string iconPrompt: pluginPath("bin/omarchy-agent-gemini-icon-prompt")
+
+  // The icon offer is made once per shell session at most; the script itself
+  // decides whether there is anything to offer, and never asks twice.
+  property bool iconPromptRun: false
 
   // Matches the agents panel's own default refresh interval. The collector
   // caches its scan for 20s, so overlapping with a system-wide install costs
@@ -64,6 +69,29 @@ Item {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("agent-gemini", text.trim())
+    }
+
+    // After the collect, not before: the offer is suppressed until there is a
+    // record, since the panel draws no tab -- and so shows no wrong icon --
+    // for an agent that has nothing to report yet.
+    onExited: {
+      if (!root.iconPromptRun && root.iconPrompt !== "") {
+        root.iconPromptRun = true
+        iconPromptProcess.running = true
+      }
+    }
+  }
+
+  // Offers to install the one thing the plugin cannot install for itself: the
+  // Gemini mark, which lives in the Agents panel's own root-owned asset dir.
+  Process {
+    id: iconPromptProcess
+    running: false
+    command: ["bash", root.iconPrompt]
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") console.warn("agent-gemini/icon", text.trim())
     }
   }
 }
