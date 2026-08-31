@@ -33,7 +33,7 @@ from typing import Any
 
 AGENT_ID = "gemini"
 AGENT_NAME = "Gemini"
-AUTH_HELP = "Sign in to Antigravity CLI with `agy` or Gemini in OpenCode."
+AUTH_HELP = "Run `gemini`, sign in to Antigravity CLI with `agy`, or use Gemini in OpenCode."
 
 SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
@@ -368,7 +368,11 @@ def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
     if cached is not None and isinstance(cached.get("limits"), list):
       return cached["limits"]
 
-  agy_bin = shutil.which("agy") or shutil.which("gemini")
+  # Antigravity only. `/usage` is an Antigravity command; the Gemini CLI has no
+  # such slash command, and an unrecognized one in `-p` mode falls through to
+  # being sent to the model as a prompt -- so probing through `gemini` would
+  # spend the user's quota on every refresh to learn nothing.
+  agy_bin = shutil.which("agy")
   if not agy_bin:
     return []
 
@@ -621,6 +625,144 @@ def scan_antigravity_transcripts() -> dict[str, Any]:
     "recentDays": [recent[day] for day in recent_dates],
     "modelUsage": bounded_model_usage,
     "totalPrompts": max(prompts, sum(hist_days.values())),
+    "totalSessions": len(sessions),
+    "activeDays": len(bounded_active_dates),
+    "activeDates": bounded_active_dates,
+  }
+
+
+# ------------------------------------------------------------- gemini cli scan
+
+
+def scan_gemini_cli_sessions() -> dict[str, Any] | None:
+  """Scan Gemini CLI chat sessions under ~/.gemini/tmp/<project>/chats/.
+
+  The Gemini CLI records one JSONL file per session: a metadata line, then one
+  record per message. A `gemini` message carries the response's raw
+  `usageMetadata` in `tokens`, so the token split here is read rather than
+  estimated from content length the way the Antigravity transcripts are.
+
+  Two control records share the stream and are skipped: `{"$set": ...}` rewrites
+  session metadata, and `{"$rewindTo": id}` drops the messages after an id. A
+  rewound turn still spent the tokens it spent, so usage counts it.
+  """
+  root = Path.home() / ".gemini" / "tmp"
+  if not root.is_dir():
+    return None
+
+  today = local_date_string()
+  min_cutoff_date = cutoff_date_string()
+  cutoff_time = time.time() - HISTORY_CUTOFF_DAYS * 86400
+  recent_dates = recent_date_strings()
+  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+  sessions: set[str] = set()
+  active_days: set[str] = set()
+  today_sessions: set[str] = set()
+  today_tokens: dict[str, int] = {}
+  usage_by_model: dict[str, dict[str, int]] = {}
+  prompts = 0
+  today_prompt_count = 0
+  today_token_total = 0
+  found_usage = False
+
+  # `session-*.json*` covers both extensions: sessions written before the JSONL
+  # format are `.json`, the CLI still reads them, so they are still usage.
+  for path in find_recent_files(root, "session-*.json*", cutoff_time):
+    session_key = path.stem
+    opened = open_regular(path, max_bytes=MAX_FILE_SIZE_BYTES)
+    if opened is None:
+      continue
+    handle, _ = opened
+    with handle:
+      for line in iter_bounded_lines(handle):
+        # Only user turns and token-bearing model turns carry usage; metadata
+        # and rewind records never do, so they never reach the JSON decoder.
+        if '"tokens"' not in line and '"user"' not in line:
+          continue
+        try:
+          entry = json.loads(line)
+        except Exception:
+          continue
+        # Every message record has a string id; the metadata and control
+        # records do not, which is exactly how the CLI itself tells them apart.
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+          continue
+
+        day = local_date_from_timestamp(entry.get("timestamp"))
+        if day < min_cutoff_date:
+          continue
+        entry_type = entry.get("type")
+
+        if entry_type == "user":
+          found_usage = True
+          prompts += 1
+          active_days.add(day)
+          if len(sessions) < MAX_SESSIONS_RECORDED:
+            sessions.add(session_key)
+          if day == today:
+            today_prompt_count += 1
+            if len(today_sessions) < MAX_SESSIONS_RECORDED:
+              today_sessions.add(session_key)
+          continue
+
+        if entry_type != "gemini":
+          continue
+        tokens = entry.get("tokens")
+        if not isinstance(tokens, dict):
+          continue
+
+        # usageMetadata counts the cached prefix inside promptTokenCount and
+        # reports thinking apart from the candidates, so the split is rebuilt
+        # rather than copied across: cached tokens move out of the input, and
+        # thinking folds into the output. Copied as-is, the cache would be
+        # counted twice and the thinking not at all.
+        cache_read = number(tokens.get("cached"))
+        input_tokens = max(0, number(tokens.get("input")) - cache_read)
+        output_tokens = number(tokens.get("output")) + number(tokens.get("thoughts"))
+        total = input_tokens + output_tokens + cache_read
+        if total <= 0:
+          continue
+
+        found_usage = True
+        active_days.add(day)
+        if len(sessions) < MAX_SESSIONS_RECORDED:
+          sessions.add(session_key)
+
+        # The model name comes out of the session file, so it is bounded in
+        # both length and cardinality before it can become a map key.
+        model = str(entry.get("model") or "gemini")[:64]
+        if model not in usage_by_model and len(usage_by_model) >= MAX_MODELS_RECORDED:
+          model = "other"
+        bucket = usage_by_model.setdefault(model, empty_bucket())
+        bucket["inputTokens"] += input_tokens
+        bucket["outputTokens"] += output_tokens
+        bucket["cacheReadInputTokens"] += cache_read
+
+        if day in recent:
+          recent[day]["messageCount"] += total
+        if day == today:
+          today_token_total += total
+          today_tokens[model] = today_tokens.get(model, 0) + total
+
+  if not found_usage:
+    return None
+
+  bounded_model_usage = dict(
+    sorted(usage_by_model.items(), key=lambda x: sum(x[1].values()), reverse=True)[:MAX_MODELS_RECORDED]
+  )
+  bounded_today_tokens = dict(
+    sorted(today_tokens.items(), key=lambda x: x[1], reverse=True)[:MAX_MODELS_RECORDED]
+  )
+  bounded_active_dates = sorted([d for d in active_days if d >= min_cutoff_date])
+
+  return {
+    "todayPrompts": today_prompt_count,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_token_total,
+    "todayTokensByModel": bounded_today_tokens,
+    "recentDays": [recent[day] for day in recent_dates],
+    "modelUsage": bounded_model_usage,
+    "totalPrompts": prompts,
     "totalSessions": len(sessions),
     "activeDays": len(bounded_active_dates),
     "activeDates": bounded_active_dates,
@@ -891,6 +1033,9 @@ def merge_stats(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
 
 def collect_local_stats() -> dict[str, Any]:
   stats = scan_antigravity_transcripts()
+  gemini_cli_stats = scan_gemini_cli_sessions()
+  if gemini_cli_stats:
+    stats = merge_stats(stats, gemini_cli_stats)
   opencode_stats = scan_opencode_sessions()
   if opencode_stats:
     stats = merge_stats(stats, opencode_stats)
@@ -916,10 +1061,20 @@ def cached_scan(max_age_seconds: float) -> dict[str, Any]:
     return summary
 
 
+def usage_record_path() -> Path:
+  state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+  return state / "omarchy" / "agents" / "usage" / f"{AGENT_ID}.json"
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description="Print the Gemini / Antigravity usage record as JSON")
   parser.add_argument("--force", action="store_true", help="Force refresh and scan")
   parser.add_argument("--limits-only", action="store_true", help="Limits-only mode (reuse cache)")
+  parser.add_argument(
+    "--write",
+    action="store_true",
+    help="Also write the record into the Omarchy agents usage directory",
+  )
   args = parser.parse_args()
 
   max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
@@ -946,6 +1101,16 @@ def main() -> None:
     "limits": limits,
   }
   record.update(stats)
+
+  # The panel draws whatever records appear in the usage directory, whoever
+  # wrote them, so --write is what lets the plugin's own service keep the tab
+  # alive without a collector installed into $OMARCHY_PATH/bin. The write is a
+  # create-and-rename, the same as omarchy-agent-usage-update's, so the two
+  # can refresh the same record without either one ever being read half-written.
+  if args.write:
+    destination = usage_record_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    write_json(destination, record)
 
   print(json.dumps(record, separators=(",", ":")))
 

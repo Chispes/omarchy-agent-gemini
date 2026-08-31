@@ -2,13 +2,20 @@
 set -euo pipefail
 
 # ==============================================================================
-# Installer for Omarchy Gemini / Antigravity Agent Collector
+# System-wide installer for the Omarchy Gemini / Antigravity Agent Collector
 # https://github.com/Chispes/omarchy-agent-gemini
 #
-# Touches exactly three things, all of them Omarchy's own:
-#   /usr/bin/omarchy-agent-usage-gemini                  the collector
-#   $OMARCHY_PATH/bin/omarchy-agent-usage-gemini         symlink; how it is found
-#   $OMARCHY_PATH/shell/plugins/agents/assets/gemini*.svg  optional bar mark
+# OPTIONAL. Installed as a plugin (`omarchy plugin add ... --enable`), the
+# Gemini tab already appears: the plugin's own service runs the bundled
+# collector and writes the usage record, no root involved. This script is for
+# the two things that genuinely need root, and nothing else:
+#
+#   /usr/bin/omarchy-agent-usage-gemini                    the collector, so it
+#   $OMARCHY_PATH/bin/omarchy-agent-usage-gemini           refreshes alongside
+#                                                          Omarchy's own agents
+#   $OMARCHY_PATH/shell/plugins/agents/assets/gemini*.svg  the Gemini mark, in
+#                                                          place of the bar glyph
+#
 # No user configuration is read or written.
 # ==============================================================================
 
@@ -26,7 +33,7 @@ fail() {
   exit 1
 }
 
-echo "==> Installing Omarchy Gemini Usage Collector..."
+echo "==> Installing Omarchy Gemini Usage Collector system-wide..."
 
 [ -f "$BIN_SRC" ] || fail "collector missing at $BIN_SRC"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required to run the collector"
@@ -61,14 +68,20 @@ fi
 
 # Refresh as the invoking user: the record belongs under their XDG state dir,
 # and running the collector as root would write it into root's.
+#
+# OMARCHY_PATH is passed through explicitly because sudo resets the
+# environment. Without it the update globs /bin/omarchy-agent-usage-* instead
+# of Omarchy's own bin, finds no collectors at all, and still exits 0 -- an
+# install that reports success and refreshes nothing.
 echo "--> Updating agent usage data..."
 RUN_USER="${SUDO_USER:-$USER}"
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-  sudo -u "$RUN_USER" omarchy-agent-usage-update gemini --force || true
+  sudo -u "$RUN_USER" env OMARCHY_PATH="$OMARCHY_PATH" \
+    omarchy-agent-usage-update gemini --force || true
 else
-  omarchy-agent-usage-update gemini --force || true
+  OMARCHY_PATH="$OMARCHY_PATH" omarchy-agent-usage-update gemini --force || true
 fi
 
 echo ""
-echo "✅ Gemini Agent collector installed successfully!"
+echo "✅ Gemini Agent collector installed system-wide!"
 echo "Open the agents panel or refresh with: omarchy agent usage-update"

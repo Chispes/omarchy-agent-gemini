@@ -11,6 +11,7 @@ Integrates Google Gemini and Antigravity CLI (`agy`) tracking into Omarchy's off
 - 📊 **Daily Token Consumption:** Displays 7-day token bar charts directly in the Omarchy panel.
 - ⏱️ **Rate Limits & Quotas:** Tracks both 5-hour session and 7-day weekly rate limit meters and reset countdowns.
 - 🤖 **Model Breakdown:** Shows token metrics grouped by model (e.g. `gemini-3.7-flash`, `gemini-2.5-pro`, `gemini-2.5-flash`).
+- 💬 **Gemini CLI Support:** Reads the chat sessions the Gemini CLI records under `~/.gemini/tmp/<project>/chats/`, taking the token split straight from each response's `usageMetadata`.
 - ⚡ **Antigravity CLI Support:** Reads sessions, prompt history, transcripts, and active account from `~/.gemini/antigravity-cli/`.
 - 🔌 **Multi-Harness Scans:** Automatically aggregates Gemini sessions run through `opencode`, `pi`, and `omp`.
 - 🎨 **Official Logos:** Includes Google Gemini sparkle icons for dark and light surfaces in Omarchy.
@@ -20,55 +21,77 @@ Integrates Google Gemini and Antigravity CLI (`agy`) tracking into Omarchy's off
 
 ## 🚀 Installation
 
-### Quick Install (Recommended)
-
-Clone the repository and run the installer:
-
 ```bash
-git clone https://github.com/Chispes/omarchy-agent-gemini.git
-cd omarchy-agent-gemini
-sudo ./install.sh
+omarchy plugin add https://github.com/Chispes/omarchy-agent-gemini.git --enable
 ```
+
+That is the whole install. No `sudo`, no second step: the plugin ships the
+collector and runs it itself.
 
 ### Requirements
 
-- Omarchy (the installer needs `$OMARCHY_PATH/bin`, default `/usr/share/omarchy/bin`)
+- Omarchy, with the Agents widget available (`omarchy.agents`)
 - `python3` — the only runtime dependency; the collector uses the standard library alone.
 
-### What the installer does:
+### Optional: install system-wide
 
-1. Installs `/usr/bin/omarchy-agent-usage-gemini` (executable collector script).
-2. Symlinks `$OMARCHY_PATH/bin/omarchy-agent-usage-gemini` -> `/usr/bin/omarchy-agent-usage-gemini`.
-   This is the discovery path; the install fails loudly if the directory is absent.
-3. Copies `gemini.svg` and `gemini-light.svg` into `$OMARCHY_PATH/shell/plugins/agents/assets/`.
-   Optional — without them the panel falls back to its own bar glyph.
-4. Triggers `omarchy agent usage-update gemini` to refresh data in the bar.
+```bash
+cd ~/.config/omarchy/plugins/chispes.agent-gemini
+sudo ./install.sh
+```
 
-It requires `sudo` for steps 1–3 and writes nowhere else; no user configuration is
-read or modified. `uninstall.sh` removes exactly those three paths plus the generated
-record in `~/.local/state/omarchy/agents/usage/gemini.json`.
+This is worth running for exactly two things, both of which need root:
+
+1. `/usr/bin/omarchy-agent-usage-gemini` plus the
+   `$OMARCHY_PATH/bin/omarchy-agent-usage-gemini` symlink, so Gemini refreshes
+   as part of `omarchy agent usage-update` alongside Omarchy's own collectors.
+2. `gemini.svg` / `gemini-light.svg` in
+   `$OMARCHY_PATH/shell/plugins/agents/assets/`, so the panel draws the Gemini
+   mark instead of its generic bar glyph.
+
+It writes nowhere else and reads no user configuration. `uninstall.sh` removes
+exactly those paths plus the generated record in
+`~/.local/state/omarchy/agents/usage/gemini.json`.
 
 ---
 
 ## 🔍 How it Works
 
-`omarchy-agent-usage-update` discovers collectors by globbing
-`$OMARCHY_PATH/bin/omarchy-agent-usage-*` (`/usr/share/omarchy/bin/` by default) — that
-symlink is what makes the collector run, which is why the installer treats a missing
-`$OMARCHY_PATH/bin` as a hard error rather than skipping it. The binary itself lives in
-`/usr/bin`, mirroring how Omarchy ships its own `claude`, `codex`, and `fireworks`
-collectors.
+The Agents panel is strictly a display: it watches
+`~/.local/state/omarchy/agents/usage/` and draws every record it finds there,
+whoever wrote it. That is the seam this plugin uses.
 
-When `omarchy-agent-usage-update` runs (periodically or on demand), it calls `omarchy-agent-usage-gemini`, which:
+`omarchy-agent-usage-update` — the path Omarchy's own collectors take — only
+globs `$OMARCHY_PATH/bin/omarchy-agent-usage-*`, a directory no plugin can
+write to without root. So the plugin does not depend on it. `Service.qml` runs
+the collector out of the plugin directory every 15 minutes with `--write`, and
+the collector writes its own record. A system-wide install adds the update path
+back; both refresh the same record by create-and-rename, so neither can be read
+half-written.
 
-1. Probes active Gemini & Antigravity rate limit quotas and reset timestamps.
+Each run:
+
+1. Reads the Gemini CLI's own chat sessions in `~/.gemini/tmp/<project>/chats/session-*.jsonl`,
+   taking the token split from each response's `usageMetadata`.
 2. Analyzes local Antigravity history (`~/.gemini/antigravity-cli/history.jsonl` & `conversation_summaries.db`).
 3. Checks transcripts in `~/.gemini/antigravity-cli/brain/` for step and token metrics.
 4. Queries `~/.local/share/opencode/opencode.db` and `~/.pi/agent/sessions/` for Gemini sessions.
-5. Detects the signed-in Google account from `~/.gemini/google_accounts.json`.
-6. Outputs a standardized JSON record to `~/.local/state/omarchy/agents/usage/gemini.json`.
+5. Probes Antigravity rate limit quotas and reset timestamps, when `agy` is installed.
+6. Detects the signed-in Google account from `~/.gemini/google_accounts.json`.
+7. Writes the merged record to `~/.local/state/omarchy/agents/usage/gemini.json`.
 
-The Omarchy QML UI automatically watches this file, creates a Gemini tab/chip, and displays usage in the dashboard.
+### Why the tab may not appear
+
+The panel hides an agent that has nothing to say: `providerHasData` in the
+Agents widget requires at least one prompt, session, active day, or rate limit
+before a tab is drawn, and the module leaves the bar entirely when no agent
+qualifies. A machine that has never run Gemini therefore shows nothing, by
+design — the tab arrives on its own at the next refresh once there is usage.
+To see the record the panel is reading:
+
+```bash
+python3 ~/.config/omarchy/plugins/chispes.agent-gemini/bin/omarchy-agent-usage-gemini --force | python3 -m json.tool
+```
 
 ---
 
@@ -107,10 +130,11 @@ no newlines is not pulled into memory as one enormous line.
 You can run the collector manually at any time:
 
 ```bash
-omarchy-agent-usage-gemini
+python3 ~/.config/omarchy/plugins/chispes.agent-gemini/bin/omarchy-agent-usage-gemini --force --write
 ```
 
-Or force an update across all Omarchy agents:
+With a system-wide install it is on `PATH` as `omarchy-agent-usage-gemini`. Or
+force an update across all Omarchy agents:
 
 ```bash
 omarchy agent usage-update --force
@@ -126,10 +150,16 @@ omarchy-shell omarchy.agents toggle
 
 ## 🗑 Uninstallation
 
-To remove the collector and assets:
+```bash
+omarchy plugin remove chispes.agent-gemini
+```
+
+If you also ran the optional system-wide install, undo that first — from the
+plugin directory, before removing it:
 
 ```bash
-sudo ./uninstall.sh
+cd ~/.config/omarchy/plugins/chispes.agent-gemini
+./uninstall.sh
 ```
 
 ---

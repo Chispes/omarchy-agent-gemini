@@ -2,8 +2,13 @@
 set -e
 
 # ==============================================================================
-# Uninstaller for Omarchy Gemini / Antigravity Agent Collector
+# Uninstaller for the system-wide Omarchy Gemini / Antigravity Agent Collector
 # https://github.com/Chispes/omarchy-agent-gemini
+#
+# This undoes install.sh only. If the plugin itself is still enabled, its
+# service keeps refreshing the usage record from the copy of the collector
+# inside the plugin directory, and the Gemini tab stays. To remove the plugin:
+#   omarchy plugin remove chispes.agent-gemini
 # ==============================================================================
 
 OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
@@ -42,10 +47,14 @@ if [ -f "$STATE_FILE" ]; then
     rm -f "$STATE_FILE"
 fi
 
+# Passed through explicitly: run under sudo the environment is reset, and the
+# update would then glob /bin instead of Omarchy's own bin and refresh nothing.
 echo "--> Refreshing Omarchy agents..."
 if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
-    omarchy-agent-usage-update --force || true
+    OMARCHY_PATH="$OMARCHY_PATH" omarchy-agent-usage-update --force || true
 fi
 
 echo ""
-echo "✅ Gemini Agent collector uninstalled successfully."
+echo "✅ System-wide Gemini Agent collector removed."
+echo "The plugin itself, if still enabled, keeps its own tab:"
+echo "  omarchy plugin remove chispes.agent-gemini"
