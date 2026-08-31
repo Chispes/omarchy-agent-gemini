@@ -16,6 +16,12 @@ set -euo pipefail
 #   $OMARCHY_PATH/shell/plugins/agents/assets/gemini*.svg  the Gemini mark, in
 #                                                          place of the bar glyph
 #
+# The mark is the half most people are actually here for, and it is the half
+# with no plugin-side workaround: Panel.qml resolves a provider's icon as
+# Qt.resolvedUrl("assets/<id>.svg") against its own root-owned directory, so a
+# plugin that cannot write there gets the generic glyph no matter what it ships.
+# `--icons-only` installs just that, and touches nothing else.
+#
 # No user configuration is read or written.
 # ==============================================================================
 
@@ -28,10 +34,68 @@ BIN_DEST="/usr/bin/omarchy-agent-usage-gemini"
 OMARCHY_BIN_DIR="$OMARCHY_PATH/bin"
 ASSETS_DEST="$OMARCHY_PATH/shell/plugins/agents/assets"
 
+ICONS_ONLY=0
+
 fail() {
   echo "install.sh: $*" >&2
   exit 1
 }
+
+usage() {
+  cat <<USAGE
+Usage: install.sh [--icons-only]
+
+  (no options)  Install the collector system-wide and the Gemini mark.
+  --icons-only  Install only gemini.svg / gemini-light.svg into
+                $ASSETS_DEST, so the Agents panel draws the Gemini mark
+                instead of its generic glyph. Nothing else is touched.
+USAGE
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+  --icons-only)
+    ICONS_ONLY=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    fail "unknown option: $1"
+    ;;
+  esac
+done
+
+# The mark is the only reason to run this script with --icons-only, so a
+# missing assets directory is an error there and a skippable extra otherwise.
+install_icons() {
+  if [ ! -d "$ASSETS_DEST" ]; then
+    if (( ICONS_ONLY )); then
+      fail "$ASSETS_DEST not found -- is Omarchy installed?"
+    fi
+    echo "--> Icons skipped ($ASSETS_DEST not found); the panel will use its bar glyph."
+    return 0
+  fi
+
+  echo "--> Installing icons to $ASSETS_DEST..."
+  for icon in gemini.svg gemini-light.svg; do
+    if [ -f "$ASSETS_SRC/$icon" ]; then
+      sudo install -m 644 "$ASSETS_SRC/$icon" "$ASSETS_DEST/$icon"
+    fi
+  done
+}
+
+if (( ICONS_ONLY )); then
+  echo "==> Installing the Gemini mark for the Omarchy Agents panel..."
+  install_icons
+  echo ""
+  echo "✅ Gemini mark installed."
+  echo "The panel picks it up on the next shell start: omarchy restart shell"
+  exit 0
+fi
 
 echo "==> Installing Omarchy Gemini Usage Collector system-wide..."
 
@@ -52,19 +116,7 @@ sudo install -m 755 "$BIN_SRC" "$BIN_DEST"
 echo "--> Linking $OMARCHY_BIN_DIR/omarchy-agent-usage-gemini..."
 sudo ln -sf "$BIN_DEST" "$OMARCHY_BIN_DIR/omarchy-agent-usage-gemini"
 
-# The mark is genuinely optional: the agents panel falls back to its bar glyph
-# for a provider that ships no assets/<id>.svg, so a missing directory here
-# costs an icon, not the feature.
-if [ -d "$ASSETS_DEST" ]; then
-  echo "--> Installing icons to $ASSETS_DEST..."
-  for icon in gemini.svg gemini-light.svg; do
-    if [ -f "$ASSETS_SRC/$icon" ]; then
-      sudo install -m 644 "$ASSETS_SRC/$icon" "$ASSETS_DEST/$icon"
-    fi
-  done
-else
-  echo "--> Icons skipped ($ASSETS_DEST not found); the panel will use its bar glyph."
-fi
+install_icons
 
 # Refresh as the invoking user: the record belongs under their XDG state dir,
 # and running the collector as root would write it into root's.

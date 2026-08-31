@@ -14,7 +14,7 @@ Integrates Google Gemini and Antigravity CLI (`agy`) tracking into Omarchy's off
 - 💬 **Gemini CLI Support:** Reads the chat sessions the Gemini CLI records under `~/.gemini/tmp/<project>/chats/`, taking the token split straight from each response's `usageMetadata`.
 - ⚡ **Antigravity CLI Support:** Reads sessions, prompt history, transcripts, and active account from `~/.gemini/antigravity-cli/`.
 - 🔌 **Multi-Harness Scans:** Automatically aggregates Gemini sessions run through `opencode`, `pi`, and `omp`.
-- 🎨 **Official Logos:** Includes Google Gemini sparkle icons for dark and light surfaces in Omarchy.
+- 🎨 **Official Logos:** Ships the Google Gemini sparkle for dark and light surfaces (`install.sh --icons-only` puts it in the panel's root-owned assets dir).
 - 🔒 **Zero-Config & Seamless:** Works alongside Omarchy's built-in Claude, Codex, and Fireworks collectors.
 
 ---
@@ -25,8 +25,28 @@ Integrates Google Gemini and Antigravity CLI (`agy`) tracking into Omarchy's off
 omarchy plugin add https://github.com/Chispes/omarchy-agent-gemini.git --enable
 ```
 
-That is the whole install. No `sudo`, no second step: the plugin ships the
-collector and runs it itself.
+That is the whole install for the *data*: the plugin ships the collector and
+runs it itself, so the Gemini tab, charts, and rate limits appear with no
+`sudo` at all.
+
+### The Gemini mark needs one root step
+
+The Agents panel resolves a provider's icon by convention and by convention
+only — `Qt.resolvedUrl("assets/<id>.svg")` against its own directory,
+`$OMARCHY_PATH/shell/plugins/agents/assets/`, which is owned by root. A plugin
+installed under `~/.config/omarchy/plugins` cannot write there, and the panel
+never looks anywhere else, so until the mark is in place the tab is drawn with
+the generic robot glyph. There is no plugin-side workaround; there is a
+one-line install:
+
+```bash
+~/.config/omarchy/plugins/chispes.agent-gemini/install.sh --icons-only
+omarchy restart shell
+```
+
+That copies `gemini.svg` and `gemini-light.svg` (light and dark surfaces) into
+the panel's assets directory and touches nothing else. `uninstall.sh` removes
+them again.
 
 ### Requirements
 
@@ -36,18 +56,15 @@ collector and runs it itself.
 ### Optional: install system-wide
 
 ```bash
-cd ~/.config/omarchy/plugins/chispes.agent-gemini
-sudo ./install.sh
+~/.config/omarchy/plugins/chispes.agent-gemini/install.sh
 ```
 
-This is worth running for exactly two things, both of which need root:
-
-1. `/usr/bin/omarchy-agent-usage-gemini` plus the
-   `$OMARCHY_PATH/bin/omarchy-agent-usage-gemini` symlink, so Gemini refreshes
-   as part of `omarchy agent usage-update` alongside Omarchy's own collectors.
-2. `gemini.svg` / `gemini-light.svg` in
-   `$OMARCHY_PATH/shell/plugins/agents/assets/`, so the panel draws the Gemini
-   mark instead of its generic bar glyph.
+The same script with no options installs the mark *and* the one other thing
+that needs root: `/usr/bin/omarchy-agent-usage-gemini` plus the
+`$OMARCHY_PATH/bin/omarchy-agent-usage-gemini` symlink, so Gemini refreshes as
+part of `omarchy agent usage-update` alongside Omarchy's own collectors. The
+plugin's own service already keeps the record fresh, so this is a convenience,
+not a requirement.
 
 It writes nowhere else and reads no user configuration. `uninstall.sh` removes
 exactly those paths plus the generated record in
