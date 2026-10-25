@@ -105,7 +105,7 @@ Each run:
 1. Reads the Gemini CLI's own chat sessions in `~/.gemini/tmp/<project>/chats/session-*.jsonl`,
    taking the token split from each response's `usageMetadata`.
 2. Analyzes local Antigravity history (`~/.gemini/antigravity-cli/history.jsonl` & `conversation_summaries.db`).
-3. Checks transcripts in `~/.gemini/antigravity-cli/brain/` for step and token metrics.
+3. Reads `~/.gemini/antigravity-cli/conversations/*.db` for the real per-step token split, model, and prompt count. Brain transcripts are only a fallback, and only `transcript.jsonl` (not the full/chunk copies).
 4. Queries `~/.local/share/opencode/opencode.db`, `~/.pi/agent/sessions/`, and
    `~/.omp/agent/sessions/` for assistant messages whose provider is Google.
 5. Probes Antigravity rate limit quotas and reset timestamps, when `agy` is installed.

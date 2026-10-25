@@ -4,10 +4,11 @@
 # omarchy:hidden=true
 """Collect Gemini / Google Antigravity usage into one display-ready JSON record.
 
-Local stats come from the Gemini CLI's own chat sessions, Antigravity CLI
-session files, transcripts, conversation summaries, and history, plus
-opencode/pi/omp sessions using Gemini/Google models; rate limits and quotas
-come from Antigravity's usage probe.
+Local stats come from the Gemini CLI's own chat sessions, Antigravity
+conversation databases (the token, model, and prompt source), transcripts as a
+fallback, conversation summaries, and history, plus opencode/pi/omp sessions
+using Gemini/Google models; rate limits and quotas come from Antigravity's
+usage probe.
 
 The record is printed on stdout, which is what omarchy-agent-usage-update
 consumes. --write also writes it to the agents usage directory itself, which is
@@ -396,6 +397,7 @@ def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
 
     session_limit: dict[str, Any] | None = None
     weekly_limit: dict[str, Any] | None = None
+    argon_limits: list[dict[str, Any]] = []
     extra_limits: list[dict[str, Any]] = []
 
     for group in groups:
@@ -407,8 +409,24 @@ def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
         reset = str(b.get("reset_time") or "")
         window = str(b.get("window") or "").lower()
         name = str(b.get("name") or "").lower()
+        bucket_id = str(b.get("id") or "").lower()
 
-        if "gemini" in g_name.lower():
+        # Argon has its own weekly quota, separate from the shared Gemini
+        # bucket. Its group name ("Gemini 4 Argon") also contains "gemini", so
+        # match it first or it would overwrite the main Weekly line. Shown as
+        # its own line, like Claude's "Fable Weekly".
+        if "argon" in g_name.lower() or "argon" in bucket_id or "argon" in name:
+          if window == "5h" or "5-hour" in name or "five" in name:
+            argon_title = "Argon Session"
+          else:
+            argon_title = "Argon Weekly"
+          argon_limits.append({
+            "label": argon_title,
+            "title": argon_title,
+            "percent": round(used, 4),
+            "resetsAt": reset,
+          })
+        elif "gemini" in g_name.lower():
           if window == "5h" or "5-hour" in name or "five" in name:
             session_limit = {
               "label": "Session (5-hour)",
@@ -424,7 +442,13 @@ def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
               "resetsAt": reset,
             }
         elif used > 0.001:
-          title = f"{g_name} {window.capitalize() if window else 'Limit'}"
+          if window == "5h":
+            window_label = "Session (5-hour)"
+          elif window == "weekly":
+            window_label = "Weekly (7-day)"
+          else:
+            window_label = window.capitalize() if window else "Limit"
+          title = f"{g_name} {window_label}".strip()
           extra_limits.append({
             "label": title,
             "title": title,
@@ -436,6 +460,7 @@ def probe_agy_limits(force: bool = False) -> list[dict[str, Any]]:
       limits.append(session_limit)
     if weekly_limit:
       limits.append(weekly_limit)
+    limits.extend(argon_limits)
     limits.extend(extra_limits)
 
     write_json(cache_file, {"limits": limits, "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat()})
@@ -490,8 +515,273 @@ def scan_antigravity_history() -> tuple[int, set[str], set[str], dict[str, int]]
   return today_prompts, today_sessions, all_sessions, active_days
 
 
+# Planner steps (step_type 15) store usage in metadata field 9:
+#   1 model enum, 2 input tokens, 3 output tokens, 5 cache-read tokens.
+# 1318/1298/1016 are MODEL_PLACEHOLDER_M318/M298/M16: gemini-3.8-flash,
+# gemini-3.7-flash, and gemini-3.1-pro; 1418 (M418) is Gemini 4 Argon and
+# 1401 (M401) is Claude Opus 5.5. The step clock is metadata field 1,
+# subfield 1, as unix seconds. User prompts are step_type 14.
+ANTIGRAVITY_MODEL_SLUGS = {
+  1418: "gemini-4-argon",
+  1401: "claude-opus-5-5",
+  1318: "gemini-3.8-flash",
+  1298: "gemini-3.7-flash",
+  1016: "gemini-3.1-pro",
+}
+MAX_CONVERSATION_DB_BYTES = 64 * 1024 * 1024
+MAX_STEPS_PER_DB = 8000
+PLANNER_STEP = 15
+USER_STEP = 14
+
+
+def read_varint(buf: bytes, index: int, end: int) -> tuple[int | None, int]:
+  value = 0
+  shift = 0
+  while index < end and shift <= 63:
+    byte = buf[index]
+    index += 1
+    value |= (byte & 0x7F) << shift
+    if not byte & 0x80:
+      return value, index
+    shift += 7
+  return None, index
+
+
+def iter_proto_fields(buf: bytes):
+  index = 0
+  end = len(buf)
+  while index < end:
+    key, index = read_varint(buf, index, end)
+    if key is None:
+      return
+    field = key >> 3
+    wire = key & 7
+    if wire == 0:
+      value, index = read_varint(buf, index, end)
+      if value is None:
+        return
+      yield "v", field, value
+    elif wire == 2:
+      length, index = read_varint(buf, index, end)
+      if length is None or length < 0 or index + length > end:
+        return
+      yield "b", field, buf[index:index + length]
+      index += length
+    elif wire == 1:
+      if index + 8 > end:
+        return
+      index += 8
+    elif wire == 5:
+      if index + 4 > end:
+        return
+      index += 4
+    else:
+      return
+
+
+def antigravity_step_time(meta: bytes) -> int | None:
+  for kind, field, value in iter_proto_fields(meta):
+    if kind == "b" and field == 1:
+      for sub_kind, sub_field, sub_value in iter_proto_fields(value):
+        if sub_kind == "v" and sub_field == 1 and sub_value > 1_000_000_000:
+          return sub_value
+  return None
+
+
+def antigravity_step_usage(meta: bytes) -> tuple[int, int, int, int] | None:
+  for kind, field, value in iter_proto_fields(meta):
+    if kind != "b" or field != 9:
+      continue
+    nums: dict[int, int] = {}
+    for sub_kind, sub_field, sub_value in iter_proto_fields(value):
+      if sub_kind == "v":
+        nums[sub_field] = sub_value
+    if 2 in nums or 3 in nums or 5 in nums:
+      return nums.get(1, 0), nums.get(2, 0), nums.get(3, 0), nums.get(5, 0)
+  return None
+
+
+def antigravity_model_slug(enum: int) -> str:
+  if enum in ANTIGRAVITY_MODEL_SLUGS:
+    return ANTIGRAVITY_MODEL_SLUGS[enum]
+  if enum:
+    return f"model-{enum}"
+  return "gemini"
+
+
+def configured_antigravity_model() -> str:
+  path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+  opened = open_regular(path, max_bytes=MAX_FILE_SIZE_BYTES)
+  if opened is None:
+    return "gemini"
+  handle, _ = opened
+  with handle:
+    try:
+      data = json.loads(handle.read(MAX_FILE_SIZE_BYTES).decode("utf-8", errors="replace"))
+    except Exception:
+      return "gemini"
+  raw = str((data or {}).get("model") or "").strip().lower()
+  if not raw:
+    return "gemini"
+  slug = re.sub(r"[()]", "", raw)
+  slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+  return slug[:64] or "gemini"
+
+
+def scan_antigravity_conversations() -> dict[str, Any] | None:
+  """Read token counts from Antigravity conversation databases.
+
+  Transcripts only carry token fields on newer sessions, and then only as a
+  text mirror of these step records. The databases are the complete local
+  history: one file per session, planner steps hold the model and the token
+  split, and user steps are the prompts.
+  """
+  root = Path.home() / ".gemini" / "antigravity-cli" / "conversations"
+  if not root.is_dir():
+    return None
+
+  today = local_date_string()
+  recent_dates = recent_date_strings()
+  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+  sessions: set[str] = set()
+  active_days: set[str] = set()
+  today_sessions: set[str] = set()
+  today_tokens: dict[str, int] = {}
+  usage_by_model: dict[str, dict[str, int]] = {}
+  prompts = 0
+  today_prompt_count = 0
+  today_token_total = 0
+  billed = 0
+
+  files = sorted(path for path in root.glob("*.db") if path.is_file())
+  for path in files[:MAX_SESSIONS_RECORDED]:
+    try:
+      if path.stat().st_size <= 0 or path.stat().st_size > MAX_CONVERSATION_DB_BYTES:
+        continue
+      conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+      conn.execute("PRAGMA query_only = ON")
+      rows = conn.execute(
+        "SELECT step_type, metadata FROM steps ORDER BY idx LIMIT ?",
+        (MAX_STEPS_PER_DB,),
+      )
+      session_id = path.stem
+      saw_session = False
+      for step_type, meta in rows:
+        if not meta:
+          continue
+        meta_bytes = bytes(meta)
+        timestamp = antigravity_step_time(meta_bytes)
+        day = local_date_from_timestamp(timestamp) if timestamp else ""
+
+        if step_type == USER_STEP:
+          prompts += 1
+          saw_session = True
+          if day:
+            active_days.add(day)
+          if day == today:
+            today_prompt_count += 1
+            if len(today_sessions) < MAX_SESSIONS_RECORDED:
+              today_sessions.add(session_id)
+          continue
+
+        if step_type != PLANNER_STEP:
+          continue
+        usage = antigravity_step_usage(meta_bytes)
+        if usage is None:
+          continue
+        model_enum, input_tokens, output_tokens, cache_read = usage
+        input_tokens = number(input_tokens)
+        output_tokens = number(output_tokens)
+        cache_read = number(cache_read)
+        total = input_tokens + output_tokens + cache_read
+        if total <= 0:
+          continue
+        billed += 1
+        saw_session = True
+        if day:
+          active_days.add(day)
+        model = antigravity_model_slug(model_enum)
+        if model not in usage_by_model and len(usage_by_model) >= MAX_MODELS_RECORDED:
+          model = "other"
+        bucket = usage_by_model.setdefault(model, empty_bucket())
+        bucket["inputTokens"] += input_tokens
+        bucket["outputTokens"] += output_tokens
+        bucket["cacheReadInputTokens"] += cache_read
+        if day in recent:
+          recent[day]["messageCount"] += total
+        if day == today:
+          if len(today_sessions) < MAX_SESSIONS_RECORDED:
+            today_sessions.add(session_id)
+          today_token_total += total
+          today_tokens[model] = today_tokens.get(model, 0) + total
+      conn.close()
+      if saw_session and len(sessions) < MAX_SESSIONS_RECORDED:
+        sessions.add(session_id)
+    except Exception:
+      continue
+
+  if billed <= 0 and prompts <= 0:
+    return None
+
+  return {
+    "todayPrompts": today_prompt_count,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_token_total,
+    "todayTokensByModel": dict(
+      sorted(today_tokens.items(), key=lambda item: item[1], reverse=True)[:MAX_MODELS_RECORDED]
+    ),
+    "recentDays": [recent[day] for day in recent_dates],
+    "modelUsage": dict(
+      sorted(usage_by_model.items(), key=lambda item: sum(item[1].values()), reverse=True)[:MAX_MODELS_RECORDED]
+    ),
+    "totalPrompts": prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+  }
+
+
+def fold_antigravity_history(stats: dict[str, Any]) -> dict[str, Any]:
+  """Union prompt history and the summary index without inventing tokens."""
+  hist_today_prompts, hist_today_sessions, hist_all_sessions, hist_days = scan_antigravity_history()
+  folded = dict(stats)
+  folded["todayPrompts"] = max(number(stats.get("todayPrompts")), hist_today_prompts)
+  folded["todaySessions"] = max(number(stats.get("todaySessions")), len(hist_today_sessions))
+  folded["totalPrompts"] = max(number(stats.get("totalPrompts")), sum(hist_days.values()))
+  folded["totalSessions"] = max(number(stats.get("totalSessions")), len(hist_all_sessions))
+
+  dates = set(stats.get("activeDates") or [])
+  for day in hist_days:
+    dates.add(day)
+
+  db_path = Path.home() / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
+  summary_sessions = 0
+  if db_path.is_file():
+    try:
+      conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+      conn.execute("PRAGMA query_only = ON")
+      for row in conn.execute(
+        "SELECT conversation_id, last_modified_time FROM conversation_summaries"
+        " ORDER BY last_modified_time DESC LIMIT 500"
+      ):
+        summary_sessions += 1
+        if row[1]:
+          dates.add(local_date_from_timestamp(row[1]))
+      conn.close()
+    except Exception:
+      pass
+  folded["totalSessions"] = max(number(folded.get("totalSessions")), summary_sessions)
+  folded["activeDates"] = sorted(dates)
+  folded["activeDays"] = len(folded["activeDates"])
+  return folded
+
+
 def scan_antigravity_transcripts() -> dict[str, Any]:
-  """Scan recent transcripts in ~/.gemini/antigravity-cli/brain/ with bounded traversal."""
+  """Prefer conversation databases; transcripts are the fallback when they are absent."""
+  db_stats = scan_antigravity_conversations()
+  if db_stats is not None:
+    return fold_antigravity_history(db_stats)
+
   today = local_date_string()
   recent_dates = recent_date_strings()
   min_cutoff_date = cutoff_date_string()
@@ -508,7 +798,7 @@ def scan_antigravity_transcripts() -> dict[str, Any]:
   today_token_total = 0
 
   brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
-  selected_files = find_recent_files(brain_dir, "transcript*.jsonl", cutoff_time, MAX_TRANSCRIPT_FILES, MAX_DIRS_TO_SCAN)
+  selected_files = find_recent_files(brain_dir, "transcript.jsonl", cutoff_time, MAX_TRANSCRIPT_FILES, MAX_DIRS_TO_SCAN)
 
   for path in selected_files:
     session_id = path.parent.parent.name
@@ -538,17 +828,32 @@ def scan_antigravity_transcripts() -> dict[str, Any]:
           entry_type = entry.get("type")
           source = entry.get("source")
 
-          model = "gemini-3.7-flash"
+          model = str(entry.get("model") or configured_antigravity_model())[:64]
           input_tokens = 0
           output_tokens = 0
           cache_read = 0
           cache_write = 0
+          recorded = (
+            entry.get("input_tokens") is not None
+            or entry.get("output_tokens") is not None
+            or entry.get("cache_read_tokens") is not None
+          )
 
           if "usage" in entry and isinstance(entry["usage"], dict):
             u = entry["usage"]
             input_tokens = number(u.get("prompt_tokens") or u.get("input_tokens") or u.get("inputTokens"))
             output_tokens = number(u.get("completion_tokens") or u.get("output_tokens") or u.get("outputTokens"))
             cache_read = number(u.get("cached_tokens") or u.get("cacheReadInputTokens"))
+          elif recorded:
+            input_tokens = number(entry.get("input_tokens"))
+            output_tokens = number(entry.get("output_tokens"))
+            cache_read = number(entry.get("cache_read_tokens"))
+            if entry_type == "USER_INPUT":
+              prompts += 1
+              if day == today:
+                today_prompt_count += 1
+                if len(today_sessions) < MAX_SESSIONS_RECORDED:
+                  today_sessions.add(session_id)
           elif entry_type == "USER_INPUT":
             prompts += 1
             content = str(entry.get("content") or "")
